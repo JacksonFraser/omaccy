@@ -11,6 +11,7 @@ Defaults: tokyo-night, docs/screenshot.png. Needs ImageMagick (`magick`).
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -155,4 +156,7 @@ class ShotApp(omaccy.App):
 
 
 if __name__ == "__main__":
-    ShotApp().run([sys.argv[0]])
+    try:
+        ShotApp().run([sys.argv[0]])
+    finally:
+        shutil.rmtree(sandbox, ignore_errors=True)
