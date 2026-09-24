@@ -1,0 +1,1262 @@
+#!/usr/bin/env python3
+"""omaccy — a Maccy-style clipboard history for Omarchy (Hyprland).
+
+  omaccy            start the background daemon (records clipboard history)
+  omaccy toggle     show / hide the popup (starts the daemon if needed)
+  omaccy show       show the popup
+  omaccy settings   open the settings window
+  omaccy quit       stop the daemon
+"""
+
+import os
+import sys
+
+# gtk4-layer-shell must be loaded before libwayland-client, which from Python
+# means LD_PRELOAD. Re-exec once with it set, then drop it so child processes
+# (wl-paste, wl-copy, wtype) don't inherit it.
+_LAYER_LIB = "/usr/lib/libgtk4-layer-shell.so"
+if os.path.exists(_LAYER_LIB) and "libgtk4-layer-shell" not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = ":".join(filter(None, [_LAYER_LIB, os.environ.get("LD_PRELOAD")]))
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+os.environ.pop("LD_PRELOAD", None)
+
+import hashlib
+import json
+import re
+import subprocess
+import time
+import tomllib
+from html import escape
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("GdkPixbuf", "2.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+gi.require_version("Graphene", "1.0")
+from gi.repository import Gdk, GdkPixbuf, Gio, GLib, Graphene, Gtk, Pango  # noqa: E402
+from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+
+APP_ID = "dev.omaccy.Omaccy"
+MAX_TEXT_BYTES = 1_000_000
+MAX_IMAGE_BYTES = 25_000_000
+DATA_DIR = os.path.join(GLib.get_user_data_dir(), "omaccy")
+HISTORY_PATH = os.path.join(DATA_DIR, "history.json")
+IMAGE_DIR = os.path.join(DATA_DIR, "images")
+CONFIG_PATH = os.path.join(GLib.get_user_config_dir(), "omaccy", "config.toml")
+THEME_COLORS = os.path.join(GLib.get_user_state_dir(), "omarchy", "current", "theme", "colors.toml")
+# Dev aid: OMACCY_THEME_FILE=<colors.toml> runs a separate, read-only preview
+# instance styled with that theme (no clipboard watching, own app id).
+PREVIEW_THEME = os.environ.get("OMACCY_THEME_FILE")
+if PREVIEW_THEME:
+    APP_ID += ".Preview"
+    THEME_COLORS = PREVIEW_THEME
+PIN_KEYS = "abcdefghijklmnoqrstuvwxyz"  # 'p' is reserved for pin/unpin
+IMAGE_MIMES = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp",
+               "image/gif": "gif", "image/bmp": "bmp", "image/tiff": "tiff"}
+TEXT_MIMES = ("UTF8_STRING", "STRING", "TEXT")
+
+CARD_WIDTH = 480
+PREVIEW_WIDTH = 440
+THUMB_WIDTH = 96
+THUMB_HEIGHT = 32
+PREVIEW_IMAGE_WIDTH = 320
+PREVIEW_IMAGE_HEIGHT = 220
+
+
+# --------------------------------------------------------------- settings ---
+
+class Settings:
+    DEFAULTS = {
+        "history_size": 200,           # unpinned items kept
+        "paste_automatically": True,   # Enter pastes; Shift+Enter does the opposite
+        "pinned_position": "top",      # "top" or "bottom"
+        "show_preview": True,
+        "preview_delay": 600,          # ms the selection must rest before previewing
+        "save_images": True,
+    }
+
+    def __init__(self, path):
+        self.path = path
+        self.values = dict(self.DEFAULTS)
+        try:
+            with open(path, "rb") as f:
+                loaded = tomllib.load(f)
+            for key, default in self.DEFAULTS.items():
+                if isinstance(loaded.get(key), type(default)):
+                    self.values[key] = loaded[key]
+        except (OSError, ValueError):
+            pass
+
+    def __getattr__(self, key):
+        try:
+            return self.__dict__["values"][key]
+        except KeyError:
+            raise AttributeError(key) from None
+
+    def set(self, key, value):
+        self.values[key] = value
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        lines = ["# omaccy settings (also editable from the Settings window)"]
+        for k, v in self.values.items():
+            lines.append(f"{k} = {str(v).lower() if isinstance(v, bool) else json.dumps(v)}")
+        with open(self.path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+
+
+# ---------------------------------------------------------------- storage ---
+
+class Store:
+    def __init__(self, path, settings):
+        self.path = path
+        self.settings = settings
+        self.items = []
+        self.load()
+
+    def load(self):
+        try:
+            with open(self.path) as f:
+                self.items = json.load(f).get("items", [])
+        except (OSError, ValueError):
+            self.items = []
+        for item in self.items:
+            self._index(item)
+
+    @staticmethod
+    def _index(item):
+        if item.get("type") == "image":
+            item["_fold"] = f"image {item.get('width', 0)}x{item.get('height', 0)} {item.get('app', '')}".casefold()
+        else:
+            item["_fold"] = item["text"].casefold()
+
+    def save(self):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        data = {"items": [{k: v for k, v in i.items() if not k.startswith("_")} for i in self.items]}
+        with open(tmp, "w") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, self.path)
+
+    def _bump_or_insert(self, existing, new, app):
+        now = time.time()
+        if existing:
+            self.items.remove(existing)
+            existing["count"] = existing.get("count", 1) + 1
+            existing["last"] = now
+            item = existing
+        else:
+            item = dict(new, count=1, first=now, last=now, pinned=False)
+            if app:
+                item["app"] = app
+            self._index(item)
+        self.items.insert(0, item)
+        self.trim()
+        self.save()
+
+    def add_text(self, text, app=None):
+        existing = next((i for i in self.items if i.get("text") == text), None)
+        self._bump_or_insert(existing, {"type": "text", "text": text}, app)
+
+    def add_image(self, data, mime, app=None):
+        name = hashlib.sha256(data).hexdigest()[:32] + "." + IMAGE_MIMES[mime]
+        path = os.path.join(IMAGE_DIR, name)
+        if not os.path.exists(path):
+            os.makedirs(IMAGE_DIR, exist_ok=True)
+            with open(path + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(path + ".tmp", path)
+        info = GdkPixbuf.Pixbuf.get_file_info(path)
+        if info is None or info[0] is None:
+            os.remove(path)
+            return
+        existing = next((i for i in self.items if i.get("image") == name), None)
+        self._bump_or_insert(existing, {"type": "image", "image": name, "mime": mime,
+                                        "width": info[1], "height": info[2]}, app)
+
+    def _drop(self, item):
+        self.items.remove(item)
+        if item.get("type") == "image":
+            try:
+                os.remove(os.path.join(IMAGE_DIR, item["image"]))
+            except OSError:
+                pass
+
+    def trim(self):
+        unpinned = [i for i in self.items if not i.get("pinned")]
+        for stale in unpinned[self.settings.history_size:]:
+            self._drop(stale)
+
+    def pinned(self):
+        return sorted((i for i in self.items if i.get("pinned")), key=lambda i: i.get("pinned_at", 0))
+
+    def history(self):
+        return [i for i in self.items if not i.get("pinned")]
+
+    def toggle_pin(self, item):
+        if item.get("pinned"):
+            item["pinned"] = False
+            item.pop("pin_key", None)
+            item.pop("pinned_at", None)
+        else:
+            used = {i.get("pin_key") for i in self.items if i.get("pinned")}
+            item["pinned"] = True
+            item["pinned_at"] = time.time()
+            item["pin_key"] = next((k for k in PIN_KEYS if k not in used), None)
+        self.trim()
+        self.save()
+
+    def remove(self, item):
+        if item in self.items:
+            self._drop(item)
+            self.save()
+
+    def clear(self):
+        for item in self.history():
+            self._drop(item)
+        self.save()
+
+
+# ------------------------------------------------------------------ theme ---
+#
+# Everything is derived from the current Omarchy theme's colors.toml, and made
+# robust for any theme: missing keys are computed, low-contrast pairs are
+# corrected, and light themes get lighter shadows.
+
+def _parse(color, fallback):
+    h = str(color or "").strip().lstrip("#")
+    if len(h) in (3, 4):
+        h = "".join(c * 2 for c in h[:3])
+    try:
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return fallback
+
+
+def _hex(rgb):
+    return "#%02x%02x%02x" % tuple(max(0, min(255, round(c))) for c in rgb)
+
+
+def _rgba(rgb, alpha):
+    return "rgba(%d,%d,%d,%s)" % (*(round(c) for c in rgb), alpha)
+
+
+def _mix(a, b, t):
+    """t=0 gives a, t=1 gives b."""
+    return tuple(x + (y - x) * t for x, y in zip(a, b))
+
+
+def _luminance(rgb):
+    def channel(c):
+        c /= 255
+        return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+    r, g, b = (channel(c) for c in rgb)
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def _contrast(a, b):
+    la, lb = sorted((_luminance(a), _luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+def _readable(on, bg, fg, minimum):
+    """Nudge `on` towards fg until it reaches `minimum` contrast against bg."""
+    for step in range(11):
+        candidate = _mix(on, fg, step / 10)
+        if _contrast(candidate, bg) >= minimum:
+            return candidate
+    return fg
+
+
+def load_palette(path):
+    try:
+        with open(path, "rb") as f:
+            raw = {k: v for k, v in tomllib.load(f).items() if isinstance(v, str)}
+    except (OSError, ValueError):
+        raw = {}
+
+    bg = _parse(raw.get("background"), (28, 28, 30))
+    fg = _parse(raw.get("foreground"), (242, 242, 242))
+    if _contrast(fg, bg) < 4.5:  # broken theme: fall back to black/white text
+        fg = max(((0, 0, 0), (255, 255, 255)), key=lambda c: _contrast(c, bg))
+    mode = raw.get("mode")
+    dark = mode != "light" if mode in ("light", "dark") else _luminance(bg) < 0.4
+
+    # Selection colour: the theme accent, unless it vanishes into the background.
+    accent = _parse(raw.get("accent") or raw.get("blue"), fg)
+    if _contrast(accent, bg) < 1.8:
+        accent = _mix(bg, fg, 0.6)
+    # Text on the selection: whichever of the theme's own colours reads best.
+    on_accent = max((bg, fg), key=lambda c: _contrast(c, accent))
+    if _contrast(on_accent, accent) < 4.5:
+        on_accent = max(((0, 0, 0), (255, 255, 255)), key=lambda c: _contrast(c, accent))
+
+    muted = _parse(raw.get("muted") or raw.get("dark_foreground"), _mix(fg, bg, 0.45))
+    muted = _readable(muted, bg, fg, 3.0)
+
+    return {
+        "dark": dark,
+        "bg": bg,
+        "fg": fg,
+        "accent": accent,
+        "on_accent": on_accent,
+        "muted": muted,
+        # Pinned-icon colour on the plain card: accent if it reads, else fg.
+        "accent_text": accent if _contrast(accent, bg) >= 3.0 else fg,
+        "raised": _mix(bg, fg, 0.06 if dark else 0.04),
+    }
+
+
+def build_css(p):
+    bg, fg, muted, accent_text = _hex(p["bg"]), _hex(p["fg"]), _hex(p["muted"]), _hex(p["accent_text"])
+    accent, on_accent = _hex(p["accent"]), _hex(p["on_accent"])
+    on_accent_dim = _rgba(p["on_accent"], 0.7)
+    card = _rgba(p["bg"], 0.90 if p["dark"] else 0.94)
+    line = _rgba(p["fg"], 0.08 if p["dark"] else 0.10)
+    shadow = ("0 20px 60px rgba(0,0,0,0.45), 0 2px 10px rgba(0,0,0,0.25)" if p["dark"]
+              else "0 16px 48px rgba(0,0,0,0.16), 0 2px 8px rgba(0,0,0,0.08)")
+    font = 'font-family: monospace;'  # fontconfig's monospace is Omarchy's font
+    return f"""
+window.omaccy {{ background: transparent; }}
+
+.card {{
+  background-color: {card};
+  color: {fg};
+  border: 1px solid {_rgba(p["fg"], 0.10 if p["dark"] else 0.14)};
+  border-radius: 14px;
+  box-shadow: {shadow};
+  {font}
+  font-size: 13px;
+}}
+
+.header {{ padding: 10px 14px 8px 14px; }}
+.header image {{ color: {muted}; }}
+.search, .search:focus, .search:focus-within {{
+  background: transparent; border: none; box-shadow: none; outline: none;
+  color: {fg}; font-size: 15px; min-height: 30px; padding: 0;
+}}
+.search text > placeholder {{ color: {muted}; }}
+.search text selection {{ background-color: {_rgba(p["accent"], 0.35)}; color: {fg}; }}
+.search text {{ caret-color: {fg}; }}
+
+separator.divider {{ background-color: {line}; min-height: 1px; margin: 0 10px; }}
+separator.section {{ background-color: {line}; min-height: 1px; margin: 5px 16px; }}
+
+list.items, list.footer {{ background: transparent; color: {fg}; padding: 5px 0; }}
+list.items > row, list.footer > row {{
+  background: transparent; color: {fg}; border-radius: 7px; outline: none;
+  margin: 0 6px; padding: 5px 8px 5px 10px; min-height: 22px;
+}}
+list.items > row:selected, list.footer > row:hover, list.footer > row.kbd {{
+  background-color: {accent}; color: {on_accent};
+}}
+list.items > row:selected .shortcut, list.footer > row:hover .shortcut, list.footer > row.kbd .shortcut,
+list.items > row:selected .dim {{ color: {on_accent_dim}; }}
+
+.shortcut {{ color: {muted}; font-size: 11px; margin-left: 12px; }}
+.dim {{ color: {muted}; }}
+picture.thumb {{ border-radius: 4px; margin-right: 10px; }}
+
+button.pin {{
+  min-width: 20px; min-height: 20px; padding: 0; margin-left: 6px;
+  background: transparent; border: none; box-shadow: none; color: {muted}; opacity: 0;
+}}
+row:selected button.pin {{ opacity: 0.8; color: {on_accent}; }}
+button.pin.pinned {{ opacity: 1; color: {accent_text}; }}
+row:selected button.pin.pinned {{ color: {on_accent}; }}
+button.pin:hover {{ opacity: 1; }}
+
+/* keyboard focus is in the footer: keep the list selection, but quietly */
+list.items.inactive > row:selected {{ background-color: {_rgba(p["accent"], 0.18)}; color: {fg}; }}
+list.items.inactive > row:selected .shortcut, list.items.inactive > row:selected .dim,
+list.items.inactive > row:selected button.pin {{ color: {muted}; }}
+list.items.inactive > row:selected button.pin.pinned {{ color: {accent_text}; }}
+
+.empty {{ color: {muted}; padding: 26px 0; }}
+
+.preview {{ padding: 14px 16px; }}
+.preview .body {{ font-size: 12px; }}
+.preview picture {{ border-radius: 6px; }}
+.preview .meta {{ color: {muted}; font-size: 11px; }}
+.preview .meta-key {{ color: {muted}; font-size: 11px; }}
+.preview .meta-value {{ font-size: 11px; }}
+
+scrollbar {{ background: transparent; }}
+scrollbar slider {{ background-color: {_rgba(p["fg"], 0.2)}; min-width: 4px; border-radius: 4px; }}
+
+window.omaccy-settings {{ background-color: {bg}; color: {fg}; {font} font-size: 13px; }}
+.settings {{ padding: 22px 26px; }}
+.settings .title {{ font-size: 17px; font-weight: bold; margin-bottom: 6px; }}
+.settings .group {{
+  background-color: {_hex(p["raised"])}; border-radius: 10px; padding: 4px 0;
+  border: 1px solid {line};
+}}
+.settings .setting {{ padding: 8px 14px; min-height: 32px; }}
+.settings .hint {{ color: {muted}; font-size: 11px; }}
+.settings switch {{ background-color: {_rgba(p["fg"], 0.15)}; border: none; }}
+.settings switch > slider {{ background-color: {bg}; border: none; box-shadow: 0 1px 2px rgba(0,0,0,0.3); }}
+.settings switch:checked {{ background-color: {accent}; }}
+.settings switch:checked > slider {{ background-color: {on_accent}; }}
+.settings spinbutton, .settings dropdown > button {{
+  background-color: {_rgba(p["fg"], 0.06)}; color: {fg}; border: 1px solid {line}; box-shadow: none;
+}}
+.settings spinbutton button, .settings spinbutton text, .settings dropdown > button label {{
+  color: {fg}; background: transparent; border: none;
+}}
+.settings label {{ color: inherit; }}
+.settings separator {{ background-color: {line}; margin: 0 14px; }}
+popover > contents {{ background-color: {bg}; color: {fg}; {font} }}
+popover modelbutton:hover, popover row:hover, popover row:selected {{ background-color: {accent}; color: {on_accent}; }}
+"""
+
+
+class Theme:
+    """Keeps one CSS provider in sync with the current Omarchy theme."""
+
+    def __init__(self, path=THEME_COLORS):
+        self.path = path
+        self.provider = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), self.provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        self.stamp = None
+        # `omarchy theme set` rewrites the current theme directory; follow it
+        # live so open windows restyle immediately.
+        current = Gio.File.new_for_path(os.path.dirname(os.path.dirname(path)))
+        self.monitor = current.monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+        self.monitor.connect("changed", lambda *_: GLib.timeout_add(300, lambda: self.apply() and False))
+
+    def apply(self):
+        try:
+            st = os.stat(self.path)
+            stamp = (st.st_mtime_ns, st.st_ino, st.st_size)
+        except OSError:
+            stamp = None
+        if stamp == self.stamp and stamp is not None:
+            return
+        self.stamp = stamp
+        palette = load_palette(self.path)
+        # The system GTK theme may be a fixed dark variant; use plain Adwaita
+        # in the theme's own mode so unstyled bits match light themes too.
+        gtk_settings = Gtk.Settings.get_default()
+        gtk_settings.set_property("gtk-theme-name", "Adwaita")
+        gtk_settings.set_property("gtk-application-prefer-dark-theme", palette["dark"])
+        self.provider.load_from_string(build_css(palette))
+
+
+# --------------------------------------------------------------- helpers ---
+
+def one_line(text, limit=300):
+    return " ".join(text[: limit * 4].split())[:limit] or "(whitespace)"
+
+
+def highlight(display, terms):
+    """Return Pango markup for display with every term occurrence in bold."""
+    if not terms:
+        return escape(display)
+    folded = display.casefold()
+    if len(folded) != len(display):
+        return escape(display)
+    spans = []
+    for term in terms:
+        for m in re.finditer(re.escape(term), folded):
+            spans.append((m.start(), m.end()))
+    if not spans:
+        return escape(display)
+    spans.sort()
+    merged = [list(spans[0])]
+    for s, e in spans[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    out, pos = [], 0
+    for s, e in merged:
+        out.append(escape(display[pos:s]))
+        out.append(f"<b>{escape(display[s:e])}</b>")
+        pos = e
+    out.append(escape(display[pos:]))
+    return "".join(out)
+
+
+def ago(ts):
+    delta = max(0, time.time() - ts)
+    for unit, secs in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if delta >= secs:
+            n = int(delta // secs)
+            return f"{n} {unit}{'s' if n != 1 else ''} ago"
+    return "just now"
+
+
+def when(ts):
+    return f"{time.strftime('%a %d %b, %H:%M', time.localtime(ts))} ({ago(ts)})"
+
+
+def image_path(item):
+    return os.path.join(IMAGE_DIR, item["image"])
+
+
+_thumbs = {}
+
+
+def thumbnail(item, scale):
+    """A small texture for list rows, cached per image and output scale."""
+    key = (item["image"], scale)
+    if key not in _thumbs:
+        try:
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(
+                image_path(item), THUMB_WIDTH * scale, THUMB_HEIGHT * scale, True)
+            fmt = Gdk.MemoryFormat.R8G8B8A8 if pixbuf.get_has_alpha() else Gdk.MemoryFormat.R8G8B8
+            _thumbs[key] = Gdk.MemoryTexture.new(pixbuf.get_width(), pixbuf.get_height(), fmt,
+                                                 pixbuf.read_pixel_bytes(), pixbuf.get_rowstride())
+        except GLib.Error:
+            _thumbs[key] = None
+    return _thumbs[key]
+
+
+class SizedPicture(Gtk.Picture):
+    """A picture drawn at an exact logical size.
+
+    Gtk.Picture asks for the texture's pixel size, which on a scaled display
+    makes images far bigger than intended; this pins the size instead.
+    """
+
+    def __init__(self, paintable, width, height, **kwargs):
+        super().__init__(paintable=paintable, can_shrink=True, content_fit=Gtk.ContentFit.CONTAIN,
+                         hexpand=False, vexpand=False, valign=Gtk.Align.CENTER, **kwargs)
+        self.size = (width, height)
+
+    def do_measure(self, orientation, _for_size):
+        n = self.size[0] if orientation == Gtk.Orientation.HORIZONTAL else self.size[1]
+        return n, n, -1, -1
+
+
+def fit(width, height, max_w, max_h):
+    ratio = min(max_w / max(width, 1), max_h / max(height, 1), 1.0)
+    return max(1, int(width * ratio)), max(1, int(height * ratio))
+
+
+def run_async(argv, done):
+    """Run argv, then call done(stdout bytes) on success or done(None)."""
+    try:
+        proc = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE)
+    except GLib.Error:
+        done(None)
+        return
+
+    def finished(p, result):
+        try:
+            _ok, out, _err = p.communicate_finish(result)
+        except GLib.Error:
+            done(None)
+            return
+        ok = p.get_if_exited() and p.get_exit_status() == 0 and out is not None
+        done(out.get_data() if ok else None)
+
+    proc.communicate_async(None, None, finished)
+
+
+def _point(x, y):
+    p = Graphene.Point()
+    p.x, p.y = x, y
+    return p
+
+
+# ----------------------------------------------------------------- popup ---
+
+class Popup(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.app = app
+        self.store = app.store
+        self.settings = app.settings
+        self.rows = []
+        self.sel = -1
+        self.last_pointer = None
+        self.preview_timer = 0
+        self.preview_shown = False
+        self.add_css_class("omaccy")
+
+        LayerShell.init_for_window(self)
+        LayerShell.set_namespace(self, "omaccy")
+        LayerShell.set_layer(self, LayerShell.Layer.OVERLAY)
+        LayerShell.set_keyboard_mode(self, LayerShell.KeyboardMode.EXCLUSIVE)
+        LayerShell.set_exclusive_zone(self, -1)
+        for edge in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM, LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+            LayerShell.set_anchor(self, edge, True)
+
+        # Full-screen transparent surface; clicking outside the cards closes it.
+        self.backdrop = Gtk.Box(hexpand=True, vexpand=True)
+        backdrop_click = Gtk.GestureClick()
+        backdrop_click.connect("pressed", self.on_backdrop_click)
+        self.backdrop.add_controller(backdrop_click)
+        self.set_child(self.backdrop)
+
+        # [spacer][card][preview]: the spacer mirrors the preview so the card
+        # stays centred and nothing moves when the preview appears.
+        self.stage = Gtk.Box(spacing=10, halign=Gtk.Align.CENTER, valign=Gtk.Align.START, hexpand=True)
+        self.backdrop.append(self.stage)
+        self.stage.append(Gtk.Box(width_request=PREVIEW_WIDTH))
+
+        self.card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.START, width_request=CARD_WIDTH)
+        self.card.add_css_class("card")
+        self.stage.append(self.card)
+
+        self.preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.START,
+                               width_request=PREVIEW_WIDTH, spacing=12)
+        self.preview.add_css_class("card")
+        self.preview.add_css_class("preview")
+        self.stage.append(self.preview)
+        self._set_preview_visible(False)
+
+        header = Gtk.Box(spacing=10)
+        header.add_css_class("header")
+        header.append(Gtk.Image.new_from_icon_name("system-search-symbolic"))
+        self.search = Gtk.Text(hexpand=True, placeholder_text="Type to search…")
+        self.search.add_css_class("search")
+        self.search.connect("changed", lambda *_: self.refresh())
+        header.append(self.search)
+        self.card.append(header)
+        self.card.append(self._divider())
+
+        self.listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.BROWSE)
+        self.listbox.add_css_class("items")
+        self.listbox.set_header_func(self._section_header)
+        self.listbox.connect("row-activated", lambda _lb, row: self.choose(row.item))
+        self.scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                           propagate_natural_height=True, max_content_height=460)
+        self.scroller.set_child(self.listbox)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self.on_pointer_motion)
+        self.scroller.add_controller(motion)
+        self.card.append(self.scroller)
+
+        self.empty = Gtk.Label()
+        self.empty.add_css_class("empty")
+        self.card.append(self.empty)
+
+        self.card.append(self._divider())
+        footer = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        footer.add_css_class("footer")
+        self.footer_rows = [
+            self._menu_row("Clear", "Ctrl+Shift+⌫", self.clear_history),
+            self._menu_row("Settings…", "Ctrl+,", self.open_settings),
+            self._menu_row("Quit", "Ctrl+Q", app.quit),
+        ]
+        for row in self.footer_rows:
+            footer.append(row)
+        footer.connect("row-activated", lambda _lb, row: row.action())
+        self.card.append(footer)
+        self.footer_sel = -1  # >= 0 while Tab has moved keyboard focus to the footer
+
+        keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self.on_key)
+        self.add_controller(keys)
+        self.connect("map", self.on_map)
+
+    # -- building -----------------------------------------------------------
+
+    def _divider(self):
+        sep = Gtk.Separator()
+        sep.add_css_class("divider")
+        return sep
+
+    def _menu_row(self, title, shortcut, action):
+        row = Gtk.ListBoxRow()
+        box = Gtk.Box()
+        box.append(Gtk.Label(label=title, hexpand=True, xalign=0))
+        hint = Gtk.Label(label=shortcut)
+        hint.add_css_class("shortcut")
+        box.append(hint)
+        row.set_child(box)
+        row.action = action
+        return row
+
+    def _section_header(self, row, before):
+        if before is not None and bool(before.item.get("pinned")) != bool(row.item.get("pinned")):
+            sep = Gtk.Separator()
+            sep.add_css_class("section")
+            row.set_header(sep)
+        else:
+            row.set_header(None)
+
+    def _item_row(self, item, shortcut, terms):
+        row = Gtk.ListBoxRow()
+        row.item = item
+        box = Gtk.Box()
+
+        if item.get("type") == "image":
+            texture = thumbnail(item, max(1, self.get_scale_factor()))
+            if texture:
+                w, h = fit(item.get("width", 1), item.get("height", 1), THUMB_WIDTH, THUMB_HEIGHT)
+                pic = SizedPicture(texture, w, h, halign=Gtk.Align.START)
+                pic.add_css_class("thumb")
+                pic.set_overflow(Gtk.Overflow.HIDDEN)
+                box.append(pic)
+            label = Gtk.Label(xalign=0, hexpand=True, label=f"{item.get('width')}×{item.get('height')}")
+            label.add_css_class("dim")
+        else:
+            label = Gtk.Label(xalign=0, hexpand=True, ellipsize=Pango.EllipsizeMode.END, single_line_mode=True)
+            label.set_markup(highlight(one_line(item["text"]), terms))
+        box.append(label)
+
+        pinned = item.get("pinned")
+        pin = Gtk.Button(icon_name="view-pin-symbolic", focusable=False, valign=Gtk.Align.CENTER,
+                         tooltip_text="Unpin (Alt+P)" if pinned else "Pin (Alt+P)")
+        pin.add_css_class("pin")
+        if pinned:
+            pin.add_css_class("pinned")
+        pin.connect("clicked", lambda *_: self.toggle_pin(item))
+        box.append(pin)
+
+        hint = Gtk.Label(label=shortcut or "", width_chars=6, xalign=1)
+        hint.add_css_class("shortcut")
+        box.append(hint)
+        row.set_child(box)
+        return row
+
+    def refresh(self, keep_item=None):
+        query = self.search.get_text().strip().casefold()
+        terms = query.split()
+
+        def matches(item):
+            return all(t in item["_fold"] for t in terms)
+
+        pinned = [i for i in self.store.pinned() if matches(i)]
+        history = [i for i in self.store.history() if matches(i)]
+
+        pinned_rows = []
+        for item in pinned:
+            key = item.get("pin_key")
+            pinned_rows.append(self._item_row(item, f"Alt+{key.upper()}" if key else None, terms))
+        history_rows = [self._item_row(item, f"Ctrl+{n + 1}" if n < 9 else None, terms)
+                        for n, item in enumerate(history)]
+        pinned_first = self.settings.pinned_position != "bottom"
+        self.rows = pinned_rows + history_rows if pinned_first else history_rows + pinned_rows
+
+        self.listbox.remove_all()
+        for row in self.rows:
+            self.listbox.append(row)
+
+        self.scroller.set_visible(bool(self.rows))
+        self.empty.set_visible(not self.rows)
+        self.empty.set_label("No matches" if terms else "Copy something to get started")
+
+        # Keep the same item selected across rebuilds, otherwise select the
+        # most recent copy (or the best match while searching).
+        index = next((n for n, r in enumerate(self.rows) if r.item is keep_item), None)
+        if index is None:
+            first_history = len(pinned_rows) if pinned_first else 0
+            index = 0 if terms or not history_rows else first_history
+        self.select(index)
+
+    def select(self, index):
+        if not self.rows:
+            self.sel = -1
+            self.schedule_preview()
+            return
+        self.sel = max(0, min(index, len(self.rows) - 1))
+        row = self.rows[self.sel]
+        self.listbox.select_row(row)
+        GLib.idle_add(self._scroll_to, row)
+        self.schedule_preview()
+
+    def _scroll_to(self, row):
+        ok, bounds = row.compute_bounds(self.listbox)
+        if not ok:
+            return False
+        y, h = bounds.origin.y, bounds.size.height
+        adj = self.scroller.get_vadjustment()
+        if y < adj.get_value():
+            adj.set_value(y)
+        elif y + h > adj.get_value() + adj.get_page_size():
+            adj.set_value(y + h - adj.get_page_size())
+        return False
+
+    def selected_item(self):
+        return self.rows[self.sel].item if 0 <= self.sel < len(self.rows) else None
+
+    # -- preview ------------------------------------------------------------
+
+    def _set_preview_visible(self, visible):
+        self.preview_shown = visible
+        self.preview.set_opacity(1 if visible else 0)
+        self.preview.set_can_target(visible)
+
+    def schedule_preview(self):
+        if self.preview_timer:
+            GLib.source_remove(self.preview_timer)
+            self.preview_timer = 0
+        item = self.selected_item()
+        if not item or not self.settings.show_preview:
+            self._set_preview_visible(False)
+        elif self.preview_shown:
+            self.fill_preview(item)  # already showing: follow the selection
+        else:
+            self.preview_timer = GLib.timeout_add(max(0, self.settings.preview_delay), self._show_preview)
+
+    def _show_preview(self):
+        self.preview_timer = 0
+        item = self.selected_item()
+        if item and self.get_visible():
+            self.fill_preview(item)
+            self._set_preview_visible(True)
+        return False
+
+    def fill_preview(self, item):
+        while child := self.preview.get_first_child():
+            self.preview.remove(child)
+
+        if item.get("type") == "image":
+            w, h = fit(item.get("width", 1), item.get("height", 1), PREVIEW_IMAGE_WIDTH, PREVIEW_IMAGE_HEIGHT)
+            try:
+                texture = Gdk.Texture.new_from_filename(image_path(item))
+                self.preview.append(SizedPicture(texture, w, h, halign=Gtk.Align.CENTER))
+            except GLib.Error:
+                self.preview.append(Gtk.Label(label="(image missing)", xalign=0))
+        else:
+            text = item["text"]
+            shown = text if len(text) <= 5000 else text[:5000] + "\n…"
+            body = Gtk.Label(label=shown, xalign=0, yalign=0, wrap=True,
+                             wrap_mode=Pango.WrapMode.WORD_CHAR, selectable=False)
+            body.add_css_class("body")
+            scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER,
+                                        propagate_natural_height=True, max_content_height=340)
+            scroll.set_child(body)
+            self.preview.append(scroll)
+
+        self.preview.append(self._divider())
+        grid = Gtk.Grid(column_spacing=14, row_spacing=3)
+        facts = []
+        if item.get("type") == "image":
+            facts.append(("Size", f"{item.get('width')}×{item.get('height')} {item.get('mime', '')}"))
+        else:
+            text = item["text"]
+            facts.append(("Length", f"{len(text):,} characters, {text.count(chr(10)) + 1:,} lines"))
+        if item.get("app"):
+            facts.append(("Copied from", item["app"]))
+        facts.append(("First copied", when(item.get("first", 0))))
+        facts.append(("Last copied", when(item.get("last", 0))))
+        facts.append(("Copies", str(item.get("count", 1))))
+        for n, (key, value) in enumerate(facts):
+            k = Gtk.Label(label=key, xalign=0)
+            k.add_css_class("meta-key")
+            v = Gtk.Label(label=value, xalign=0, ellipsize=Pango.EllipsizeMode.END, hexpand=True)
+            v.add_css_class("meta-value")
+            grid.attach(k, 0, n, 1, 1)
+            grid.attach(v, 1, n, 1, 1)
+        self.preview.append(grid)
+
+        pin_word = "unpin" if item.get("pinned") else "pin"
+        hints = Gtk.Label(label=f"Alt+P to {pin_word} · Alt+Delete to remove", xalign=0)
+        hints.add_css_class("meta")
+        self.preview.append(hints)
+
+    # -- show / hide --------------------------------------------------------
+
+    def focus_footer(self, index):
+        index = max(0, min(index, len(self.footer_rows) - 1))
+        if self.footer_sel >= 0:
+            self.footer_rows[self.footer_sel].remove_css_class("kbd")
+        self.footer_sel = index
+        self.footer_rows[index].add_css_class("kbd")
+        self.listbox.add_css_class("inactive")
+
+    def leave_footer(self):
+        if self.footer_sel >= 0:
+            self.footer_rows[self.footer_sel].remove_css_class("kbd")
+        self.footer_sel = -1
+        self.listbox.remove_css_class("inactive")
+
+    def open(self):
+        self.leave_footer()
+        self.app.theme.apply()
+        self._set_preview_visible(False)
+        self.search.set_text("")
+        self.refresh()
+        self.last_pointer = None
+        self.present()
+        self.search.grab_focus()
+
+    def close_popup(self):
+        if self.preview_timer:
+            GLib.source_remove(self.preview_timer)
+            self.preview_timer = 0
+        self._set_preview_visible(False)
+        self.set_visible(False)
+
+    def toggle(self):
+        if self.get_visible():
+            self.close_popup()
+        else:
+            self.open()
+
+    def on_map(self, *_):
+        # Place the cards a little above centre on whichever monitor we landed on.
+        monitor = self.get_display().get_monitor_at_surface(self.get_surface())
+        if monitor:
+            self.stage.set_margin_top(int(monitor.get_geometry().height * 0.14))
+
+    # -- actions ------------------------------------------------------------
+
+    def choose(self, item, invert=False):
+        if not item:
+            return
+        self.close_popup()
+        try:
+            if item.get("type") == "image":
+                with open(image_path(item), "rb") as f:
+                    subprocess.run(["wl-copy", "--type", item.get("mime", "image/png")], stdin=f, timeout=3)
+            else:
+                subprocess.run(["wl-copy"], input=item["text"].encode(), timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return
+        if self.settings.paste_automatically != invert:
+            # Give Hyprland a moment to hand focus back to the previous window.
+            GLib.timeout_add(150, self._paste)
+
+    def _paste(self):
+        subprocess.Popen(["wtype", "-M", "shift", "-k", "Insert", "-m", "shift"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return False
+
+    def toggle_pin(self, item):
+        if item:
+            self.store.toggle_pin(item)
+            self.refresh(keep_item=item)
+
+    def remove(self, item):
+        if item:
+            index = self.sel
+            self.store.remove(item)
+            self.refresh()
+            self.select(index)
+
+    def clear_history(self):
+        self.store.clear()
+        self.refresh()
+
+    def open_settings(self):
+        self.close_popup()
+        self.app.open_settings(from_popup=True)
+
+    # -- input --------------------------------------------------------------
+
+    def on_backdrop_click(self, _gesture, _n, x, y):
+        widget = self.backdrop.pick(x, y, Gtk.PickFlags.DEFAULT)
+        while widget is not None:
+            if widget is self.card or (widget is self.preview and self.preview_shown):
+                return
+            widget = widget.get_parent()
+        self.close_popup()
+
+    def on_pointer_motion(self, _ctrl, x, y):
+        # Follow the pointer like a menu, but only when it really moves (not
+        # when the list scrolls or rebuilds underneath a still pointer).
+        if self.last_pointer is not None and abs(x - self.last_pointer[0]) + abs(y - self.last_pointer[1]) < 2:
+            return
+        first = self.last_pointer is None
+        self.last_pointer = (x, y)
+        if first:
+            return
+        ok, point = self.scroller.compute_point(self.listbox, _point(x, y))
+        if ok:
+            row = self.listbox.get_row_at_y(int(point.y))
+            if row in self.rows and self.rows.index(row) != self.sel:
+                self.sel = self.rows.index(row)
+                self.listbox.select_row(row)
+                self.schedule_preview()
+
+    def on_key(self, _ctrl, keyval, _code, state):
+        ctrl = bool(state & Gdk.ModifierType.CONTROL_MASK)
+        alt = bool(state & Gdk.ModifierType.ALT_MASK)
+        shift = bool(state & Gdk.ModifierType.SHIFT_MASK)
+        key = Gdk.keyval_name(Gdk.keyval_to_lower(keyval)) or ""
+
+        back_tab = key == "ISO_Left_Tab" or (key == "Tab" and shift)
+
+        if self.footer_sel >= 0:
+            if back_tab or key == "Escape":
+                self.leave_footer()
+                return True
+            if key == "Tab" or key == "Down" or (ctrl and key in ("j", "n")):
+                self.focus_footer(self.footer_sel + 1)
+                return True
+            if key == "Up" or (ctrl and key in ("k", "p")):
+                self.focus_footer(self.footer_sel - 1)
+                return True
+            if key in ("Return", "KP_Enter", "space"):
+                action = self.footer_rows[self.footer_sel].action
+                self.leave_footer()
+                action()
+                return True
+            # Anything else (typing, shortcuts) goes back to the list as usual.
+            self.leave_footer()
+
+        if back_tab:
+            pass  # already in the list
+        elif key == "Tab":
+            self.focus_footer(0)
+        elif key == "Escape":
+            if self.search.get_text():
+                self.search.set_text("")
+            else:
+                self.close_popup()
+        elif key == "Down" or (ctrl and key in ("j", "n")):
+            self.select(self.sel + 1)
+        elif key == "Up" or (ctrl and key in ("k", "p")):
+            self.select(self.sel - 1)
+        elif key == "Page_Down":
+            self.select(self.sel + 10)
+        elif key == "Page_Up":
+            self.select(self.sel - 10)
+        elif key in ("Return", "KP_Enter"):
+            self.choose(self.selected_item(), invert=shift)
+        elif ctrl and len(key) == 1 and key in "123456789":
+            history = [r.item for r in self.rows if not r.item.get("pinned")]
+            n = int(key) - 1
+            if n < len(history):
+                self.choose(history[n])
+        elif alt and key == "p":
+            self.toggle_pin(self.selected_item())
+        elif alt and key in ("Delete", "BackSpace"):
+            self.remove(self.selected_item())
+        elif alt and len(key) == 1 and key in PIN_KEYS:
+            item = next((r.item for r in self.rows if r.item.get("pin_key") == key), None)
+            if item:
+                self.choose(item, invert=shift)
+        elif ctrl and shift and key == "BackSpace":
+            self.clear_history()
+        elif ctrl and key == "comma":
+            self.open_settings()
+        elif ctrl and key == "q":
+            self.app.quit()
+        else:
+            if not self.search.has_focus():
+                self.search.grab_focus()
+            return False
+        return True
+
+
+# -------------------------------------------------------- settings window ---
+
+class SettingsWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title="omaccy Settings", default_width=520, resizable=False)
+        self.app = app
+        self.settings = app.settings
+        self.add_css_class("omaccy-settings")
+        self.return_to_popup = False
+        self.connect("close-request", self.on_close)
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda _c, kv, _k, _s: kv == Gdk.KEY_Escape and (self.close() or True))
+        self.add_controller(keys)
+
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        page.add_css_class("settings")
+        self.set_child(page)
+        title = Gtk.Label(label="omaccy", xalign=0)
+        title.add_css_class("title")
+        page.append(title)
+
+        page.append(self._group([
+            self._spin("History size", "Unpinned items to keep", "history_size", 10, 1000, 10),
+            self._switch("Paste automatically", "Enter pastes into the previous window; Shift+Enter only copies",
+                         "paste_automatically"),
+            self._switch("Save images", "Keep copied images (screenshots, pictures) in history", "save_images"),
+        ]))
+        page.append(self._group([
+            self._choice("Pinned items", "Where favourites sit in the list", "pinned_position",
+                         [("top", "Top"), ("bottom", "Bottom")]),
+            self._switch("Show preview", "Full text or image beside the list", "show_preview"),
+            self._spin("Preview delay", "Milliseconds before the preview appears", "preview_delay", 0, 5000, 100),
+        ]))
+
+        hint = Gtk.Label(xalign=0, wrap=True, label="Open with SUPER + SHIFT + V (change it in ~/.config/hypr/bindings.lua). "
+                         f"Settings are stored in {CONFIG_PATH.replace(os.path.expanduser('~'), '~')}.")
+        hint.add_css_class("hint")
+        page.append(hint)
+
+    def on_close(self, *_):
+        self.set_visible(False)
+        # Opened from the popup: closing (Esc or SUPER+W) goes back to the list.
+        if self.return_to_popup:
+            self.return_to_popup = False
+            GLib.idle_add(lambda: self.app.popup.open() and False)
+        return True
+
+    def _group(self, rows):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.add_css_class("group")
+        for n, row in enumerate(rows):
+            if n:
+                box.append(Gtk.Separator())
+            box.append(row)
+        return box
+
+    def _row(self, title, subtitle, control):
+        row = Gtk.Box(spacing=16)
+        row.add_css_class("setting")
+        text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True, valign=Gtk.Align.CENTER)
+        text.append(Gtk.Label(label=title, xalign=0))
+        sub = Gtk.Label(label=subtitle, xalign=0, wrap=True)
+        sub.add_css_class("hint")
+        text.append(sub)
+        row.append(text)
+        control.set_valign(Gtk.Align.CENTER)
+        row.append(control)
+        return row
+
+    def _switch(self, title, subtitle, key):
+        switch = Gtk.Switch(active=getattr(self.settings, key))
+        switch.connect("notify::active", lambda s, _p: self.app.change_setting(key, s.get_active()))
+        return self._row(title, subtitle, switch)
+
+    def _spin(self, title, subtitle, key, lo, hi, step):
+        spin = Gtk.SpinButton.new_with_range(lo, hi, step)
+        spin.set_value(getattr(self.settings, key))
+        spin.connect("value-changed", lambda s: self.app.change_setting(key, s.get_value_as_int()))
+        return self._row(title, subtitle, spin)
+
+    def _choice(self, title, subtitle, key, options):
+        dropdown = Gtk.DropDown.new_from_strings([label for _, label in options])
+        values = [value for value, _ in options]
+        current = getattr(self.settings, key)
+        dropdown.set_selected(values.index(current) if current in values else 0)
+        dropdown.connect("notify::selected",
+                         lambda d, _p: self.app.change_setting(key, values[d.get_selected()]))
+        return self._row(title, subtitle, dropdown)
+
+
+# -------------------------------------------------------------- the app ---
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
+        self.settings = Settings(CONFIG_PATH)
+        self.store = None
+        self.popup = None
+        self.settings_window = None
+        self.watcher = None
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        self.hold()
+        self.theme = Theme()
+        self.theme.apply()
+        self.store = Store(HISTORY_PATH, self.settings)
+        self.popup = Popup(self)
+        if not PREVIEW_THEME:
+            self.start_watcher()
+
+    def do_command_line(self, cmdline):
+        args = cmdline.get_arguments()[1:]
+        command = args[0] if args else "daemon"
+        if command == "toggle":
+            self.popup.toggle()
+        elif command == "show":
+            self.popup.open()
+        elif command == "settings":
+            self.open_settings()
+        elif command == "quit":
+            self.quit()
+        elif command != "daemon":
+            cmdline.printerr(__doc__)
+            return 1
+        return 0
+
+    def open_settings(self, from_popup=False):
+        self.theme.apply()
+        if self.settings_window is None:
+            self.settings_window = SettingsWindow(self)
+        self.settings_window.return_to_popup = from_popup
+        self.settings_window.present()
+
+    def change_setting(self, key, value):
+        self.settings.set(key, value)
+        if key == "history_size":
+            self.store.trim()
+            self.store.save()
+
+    # -- clipboard watching -------------------------------------------------
+
+    def start_watcher(self):
+        # wl-paste runs the command on every selection change; we just need
+        # the signal (and the state, so sensitive/cleared selections are skipped).
+        argv = ["wl-paste", "--watch", "sh", "-c", 'echo "${CLIPBOARD_STATE:-data}"']
+        try:
+            self.watcher = Gio.Subprocess.new(argv, Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error as e:
+            print(f"omaccy: cannot start wl-paste: {e.message}", file=sys.stderr)
+            GLib.timeout_add_seconds(5, self._restart_watcher)
+            return
+        stream = Gio.DataInputStream.new(self.watcher.get_stdout_pipe())
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_watch_line)
+
+    def _restart_watcher(self):
+        self.start_watcher()
+        return False
+
+    def _on_watch_line(self, stream, result):
+        try:
+            line, _ = stream.read_line_finish_utf8(result)
+        except GLib.Error:
+            line = None
+        if line is None:  # wl-paste exited; bring it back
+            GLib.timeout_add_seconds(1, self._restart_watcher)
+            return
+        if line.strip() == "data":
+            run_async(["timeout", "2", "wl-paste", "--list-types"], self._on_types)
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, None, self._on_watch_line)
+
+    def _on_types(self, data):
+        if data is None:
+            return
+        types = data.decode("utf-8", errors="replace").splitlines()
+        if "x-kde-passwordManagerHint" in types:
+            return
+        if any(t.startswith("text/plain") or t in TEXT_MIMES for t in types):
+            run_async(["timeout", "2", "wl-paste", "--no-newline", "--type", "text"],
+                      lambda d: self._with_app(lambda app: self._store_text(d, app)))
+        elif self.settings.save_images:
+            mime = next((m for m in IMAGE_MIMES if m in types), None)
+            if mime:
+                run_async(["timeout", "5", "wl-paste", "--type", mime],
+                          lambda d: self._with_app(lambda app: self._store_image(d, mime, app)))
+
+    def _with_app(self, then):
+        """Look up the focused window's class (the app the copy came from)."""
+        def got(data):
+            try:
+                window = json.loads(data or b"{}")
+                app = window.get("class") or window.get("initialClass")
+            except ValueError:
+                app = None
+            then(app)
+        run_async(["hyprctl", "activewindow", "-j"], got)
+
+    def _store_text(self, data, app):
+        if not data or len(data) > MAX_TEXT_BYTES:
+            return
+        text = data.decode("utf-8", errors="replace")
+        if text.strip():
+            self._stored(lambda: self.store.add_text(text, app))
+
+    def _store_image(self, data, mime, app):
+        if data and len(data) <= MAX_IMAGE_BYTES:
+            self._stored(lambda: self.store.add_image(data, mime, app))
+
+    def _stored(self, add):
+        selected = self.popup.selected_item()
+        add()
+        if self.popup.get_visible():
+            self.popup.refresh(keep_item=selected)
+
+    def do_shutdown(self):
+        if self.watcher:
+            self.watcher.force_exit()
+        Gtk.Application.do_shutdown(self)
+
+
+if __name__ == "__main__":
+    sys.exit(App().run(sys.argv))
