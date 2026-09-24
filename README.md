@@ -137,3 +137,7 @@ Then remove the four Hyprland lines above. If you turned off Omarchy's clipboard
 ## Thanks
 
 To [Maccy](https://github.com/p0deje/Maccy) by Alex Rodionov, the clipboard manager this imitates, and to [Omarchy](https://omarchy.org) for its clipboard capture approach.
+
+## License
+
+[MIT](LICENSE)
