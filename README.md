@@ -35,7 +35,7 @@ sudo pacman -S python-gobject gtk4 gtk4-layer-shell wl-clipboard wtype
 ## Install
 
 ```sh
-git clone https://github.com/<you>/omaccy ~/repos/omaccy
+git clone https://github.com/JacksonFraser/omaccy ~/repos/omaccy
 ln -s ~/repos/omaccy/omaccy ~/.local/bin/omaccy
 ```
 
