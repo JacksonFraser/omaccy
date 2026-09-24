@@ -4,6 +4,8 @@ Maccy (an open source clipboard manager for macOS) has ruined computers for me. 
 
 **omaccy** is a [Maccy](https://github.com/p0deje/Maccy)-style clipboard history for [Omarchy](https://omarchy.org) (Hyprland). It is one Python script: a small background daemon records everything you copy, and a keyboard-driven popup lets you search it and paste straight back into the window you were in.
 
+![omaccy in the Tokyo Night theme: the clipboard list with two pinned items, and the preview panel showing a copied code snippet](docs/screenshot.png)
+
 ## Features
 
 - **History:** text and images, 200 items by default (configurable), with duplicates merged and moved back to the top.
@@ -123,6 +125,8 @@ OMACCY_THEME_FILE=/usr/share/omarchy/themes/catppuccin-latte/colors.toml omaccy 
 ```
 
 This opens a separate copy that doesn't record the clipboard. Close it with the same command, replacing `show` with `quit`.
+
+The README screenshot is made from sample data by `tools/readme-screenshot.py [theme]`, so it never includes your own clipboard.
 
 ## Uninstall
 
